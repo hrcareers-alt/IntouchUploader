@@ -284,6 +284,34 @@ def norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
+def repair_mojibake(text: str) -> str:
+    """
+    Fix common UTF-8→GBK mojibake seen in the tracker (e.g. ñ stored as 帽).
+
+    Example: 'Ca帽oneo' → 'Cañoneo'
+    """
+    if not text:
+        return text
+
+    # Targeted: UTF-8 bytes of ñ (C3 B1) mis-decoded as GBK become 帽 (U+5E3D).
+    targeted = (
+        text.replace("\u5e3d", "ñ")
+        .replace("Ã±", "ñ")
+        .replace("Ã‘", "Ñ")
+    )
+
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in targeted)
+    has_latin = any(("A" <= ch <= "Z") or ("a" <= ch <= "z") for ch in targeted)
+    if has_cjk and has_latin:
+        try:
+            repaired = text.encode("gbk").decode("utf-8")
+            if repaired.isprintable():
+                return repaired
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return targeted
+
+
 def col_letter(index_zero_based: int) -> str:
     """Convert 0-based column index to A1 column letters."""
     n = index_zero_based + 1
@@ -761,11 +789,12 @@ def load_candidates(values: list[list[str]]) -> tuple[list[Candidate], dict[str,
         candidates.append(
             Candidate(
                 sheet_row=row_offset,
-                last_name=cell("last_name").strip(),
-                first_name=cell("first_name").strip(),
+                # Repair tracker mojibake (ñ→帽) before form submit; do not rewrite the sheet name cells.
+                last_name=repair_mojibake(cell("last_name").strip()),
+                first_name=repair_mojibake(cell("first_name").strip()),
                 contact=contact.strip(),
                 email=cell("email").strip(),
-                location=cell("location").strip(),
+                location=repair_mojibake(cell("location").strip()),
                 bpo_raw=cell("bpo").strip(),
                 timestamp_raw=ts_raw.strip(),
                 record_date=record_date,
