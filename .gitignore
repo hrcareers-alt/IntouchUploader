@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/*.log
+logs/*.json
+logs/*.jsonl
+data/submission_log.jsonl
+data/run.lock
+*-service-account*.json
+credentials.json
+token.json
