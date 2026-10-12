@@ -19,7 +19,8 @@ Usage:
   python intouch_uploader.py --live --max-submit 5
 
 Environment:
-  GOOGLE_APPLICATION_CREDENTIALS  Path to service-account JSON with Sheets access
+  GOOGLE_SERVICE_ACCOUNT_JSON     Preferred: full service-account JSON key contents
+  GOOGLE_APPLICATION_CREDENTIALS  Alternative: path to a service-account JSON file
   INTOUCH_SPREADSHEET_ID          Optional override (default: tracker below)
   INTOUCH_SHEET_GID               Optional override (default: 112514731)
   INTOUCH_DRY_RUN                 Set to "0" / "false" to allow live mode via env
@@ -585,10 +586,45 @@ def build_mapped_payload(candidate: Candidate) -> tuple[Optional[MappedPayload],
 # ---------------------------------------------------------------------------
 
 
+def resolve_credentials_path() -> Path:
+    """
+    Resolve Google credentials from either:
+      - GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON secret contents), or
+      - GOOGLE_APPLICATION_CREDENTIALS (path to an existing JSON file)
+    """
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is set but is not valid JSON"
+            ) from exc
+        if not isinstance(parsed, dict) or parsed.get("type") != "service_account":
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON must be a Google service-account key JSON"
+            )
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        out = STATE_DIR / "google_service_account.json"
+        out.write_text(json.dumps(parsed), encoding="utf-8")
+        os.chmod(out, 0o600)
+        return out
+
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if creds_path and Path(creds_path).exists():
+        return Path(creds_path)
+
+    raise RuntimeError(
+        "Missing Google credentials. Set secret GOOGLE_SERVICE_ACCOUNT_JSON "
+        "(service-account JSON contents) or GOOGLE_APPLICATION_CREDENTIALS "
+        "(path to the JSON key file)."
+    )
+
+
 class SheetsClient:
-    def __init__(self, spreadsheet_id: str, credentials_path: str):
+    def __init__(self, spreadsheet_id: str, credentials_path: str | Path):
         creds = service_account.Credentials.from_service_account_file(
-            credentials_path, scopes=SCOPES
+            str(credentials_path), scopes=SCOPES
         )
         self.service = build("sheets", "v4", credentials=creds, cache_discovery=False)
         self.spreadsheet_id = spreadsheet_id
@@ -876,12 +912,7 @@ def run(dry_run: bool = True, max_submit: Optional[int] = None) -> RunSummary:
 
     spreadsheet_id = os.getenv("INTOUCH_SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)
     sheet_gid = int(os.getenv("INTOUCH_SHEET_GID", str(DEFAULT_SHEET_GID)))
-    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if not creds_path or not Path(creds_path).exists():
-        raise RuntimeError(
-            "GOOGLE_APPLICATION_CREDENTIALS must point to a service-account JSON "
-            "with edit access to the candidate tracker spreadsheet."
-        )
+    creds_path = resolve_credentials_path()
 
     with RunLock(RUN_LOCK):
         sheets = SheetsClient(spreadsheet_id, creds_path)
