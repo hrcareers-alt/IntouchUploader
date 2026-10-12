@@ -568,6 +568,34 @@ def map_residence_and_site(
     return None, None, f"location not mappable to form residence/site options: {location!r}"
 
 
+def normalize_contact_number(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return a single phone-number string for the form.
+
+    Prefers the first digit group when cells contain multiple numbers
+    (e.g. '09636715467/ 09651168536'). Preserves leading zeros.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None, "missing contact number"
+    # Split on common separators for multiple numbers.
+    parts = re.split(r"[/,;|]|\bor\b|\band\b", text, flags=re.I)
+    for part in parts:
+        digits = re.sub(r"\D", "", part)
+        if len(digits) >= 10:
+            # Keep original leading-zero style from the chosen segment when present.
+            seg = part.strip()
+            m = re.search(r"0?\d{10,15}", seg)
+            if m:
+                return m.group(0), None
+            return digits, None
+    # Fallback: first 10–15 digit run anywhere in the raw string.
+    m = re.search(r"0?\d{10,15}", text)
+    if m:
+        return m.group(0), None
+    return None, f"contact number not usable for form (must be a number): {raw!r}"
+
+
 def build_mapped_payload(candidate: Candidate) -> tuple[Optional[MappedPayload], Optional[str]]:
     if is_blank(candidate.last_name) or is_blank(candidate.first_name):
         return None, "missing first/last name"
@@ -592,9 +620,9 @@ def build_mapped_payload(candidate: Candidate) -> tuple[Optional[MappedPayload],
     if site not in PREFERRED_SITES:
         return None, f"preferred site not in form: {site!r}"
 
-    # Preserve contact as string (leading zeros).
-    contact = str(candidate.contact).strip()
-    # If Sheets dropped a leading 0 on an 10-digit PH mobile, keep as-is (do not invent).
+    contact, contact_err = normalize_contact_number(candidate.contact)
+    if contact_err:
+        return None, contact_err
 
     payload = MappedPayload(
         privacy_consent=FIXED_ANSWERS["privacy_consent"],
