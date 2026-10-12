@@ -21,6 +21,9 @@ Usage:
 Environment:
   GOOGLE_SERVICE_ACCOUNT_JSON     Preferred: full service-account JSON key contents
   GOOGLE_APPLICATION_CREDENTIALS  Alternative: path to a service-account JSON file
+  GOOGLE_SIGNIN_EMAIL             Google account for form sign-in
+                                  (default: hrcareers@olympuz-org.com)
+  GOOGLE_SIGNIN_PASSWORD          Google password / App Password (secret; never commit)
   INTOUCH_SPREADSHEET_ID          Optional override (default: tracker below)
   INTOUCH_SHEET_GID               Optional override (default: 112514731)
   INTOUCH_DRY_RUN                 Set to "0" / "false" to allow live mode via env
@@ -59,6 +62,7 @@ INTOUCH_SUCCESS_MARK = "Executive Team"
 
 DEFAULT_SPREADSHEET_ID = "1NoRX955F0dpxMReiC-6lcd3hgxFDccS3H9hzabTQghE"
 DEFAULT_SHEET_GID = 112514731  # "VALID CONSENT - TP, FVR & EXL"
+DEFAULT_GOOGLE_SIGNIN_EMAIL = "hrcareers@olympuz-org.com"
 
 FORM_VIEW_URL = (
     "https://docs.google.com/forms/d/e/"
@@ -772,73 +776,260 @@ def load_candidates(values: list[list[str]]) -> tuple[list[Candidate], dict[str,
 
 
 # ---------------------------------------------------------------------------
-# Form submission
+# Form submission (browser + Google sign-in)
 # ---------------------------------------------------------------------------
 
 
-def verify_form_available(session: requests.Session) -> None:
-    resp = session.get(FORM_VIEW_URL, timeout=45)
-    resp.raise_for_status()
-    if "formResponse" not in resp.text and "FB_PUBLIC_LOAD_DATA_" not in resp.text:
-        raise RuntimeError("Form does not appear to be accepting responses / structure unrecognized")
-    # Sanity-check known entry ids still present
-    for key, entry_id in FORM_ENTRIES.items():
-        if f"entry.{entry_id}" not in resp.text and entry_id not in resp.text:
-            # Multi-page forms may only expose page-1 entries in HTML.
-            if key != "privacy_consent":
-                continue
+def get_google_signin_credentials() -> tuple[str, str]:
+    email = (
+        os.getenv("GOOGLE_SIGNIN_EMAIL", "").strip()
+        or DEFAULT_GOOGLE_SIGNIN_EMAIL
+    )
+    password = os.getenv("GOOGLE_SIGNIN_PASSWORD", "").strip()
+    if not password:
+        raise RuntimeError(
+            "Missing secret GOOGLE_SIGNIN_PASSWORD. Add it in Cursor secrets "
+            f"(account defaults to {DEFAULT_GOOGLE_SIGNIN_EMAIL}). "
+            "Do not paste the password into chat."
+        )
+    return email, password
+
+
+class BrowserFormSession:
+    """
+    Persistent Chromium session that signs into Google once, then submits
+    IntouchCX form responses one candidate at a time.
+    """
+
+    def __init__(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self._context = self._browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+        self._page = self._context.new_page()
+        self._signed_in = False
+
+    def close(self) -> None:
+        try:
+            self._context.close()
+        except Exception:
+            pass
+        try:
+            self._browser.close()
+        except Exception:
+            pass
+        try:
+            self._playwright.stop()
+        except Exception:
+            pass
+
+    def ensure_signed_in(self) -> None:
+        if self._signed_in:
+            return
+        email, password = get_google_signin_credentials()
+        logger.info("Signing into Google as %s (password from secret)", email)
+        page = self._page
+        page.goto(
+            "https://accounts.google.com/ServiceLogin?hl=en",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(1500)
+
+        # Email step
+        email_box = page.locator('input[type="email"]').first
+        email_box.wait_for(state="visible", timeout=30000)
+        email_box.fill(email)
+        page.locator("#identifierNext, button:has-text('Next')").first.click()
+        page.wait_for_timeout(2500)
+
+        # Challenge / blocked detection before password
+        body = page.inner_text("body").lower()
+        if any(
+            p in body
+            for p in (
+                "couldn't find your google account",
+                "couldn’t find your google account",
+                "enter a valid email",
+                "couldn't sign you in",
+            )
+        ):
             raise RuntimeError(
-                f"Form structure changed: missing entry for {key} ({entry_id}). Stopping."
+                f"Google sign-in rejected the email {email!r}. "
+                "Check GOOGLE_SIGNIN_EMAIL / account access."
             )
 
+        # Password step
+        pwd_box = page.locator('input[type="password"]').first
+        try:
+            pwd_box.wait_for(state="visible", timeout=30000)
+        except Exception as exc:
+            snippet = page.inner_text("body")[:400].replace("\n", " ")
+            raise RuntimeError(
+                "Google did not show the password field (possible CAPTCHA / "
+                f"2FA / workspace block). Page text: {snippet!r}"
+            ) from exc
+        pwd_box.fill(password)
+        page.locator("#passwordNext, button:has-text('Next')").first.click()
+        page.wait_for_timeout(4000)
 
-def payload_to_form_data(payload: MappedPayload) -> dict[str, str]:
-    data = {}
-    mapping = asdict(payload)
-    for field_name, value in mapping.items():
-        entry_id = FORM_ENTRIES[field_name]
-        data[f"entry.{entry_id}"] = value
-    return data
+        body = page.inner_text("body").lower()
+        url = page.url
+        if any(
+            p in body
+            for p in (
+                "wrong password",
+                "incorrect password",
+                "couldn't sign you in",
+                "verify it’s you",
+                "verify it's you",
+                "2-step verification",
+                "2-step",
+                "account recovery",
+                "captcha",
+            )
+        ) or "challenge" in url or "signin/rejected" in url:
+            raise RuntimeError(
+                "Google sign-in failed or requires interactive verification "
+                "(wrong password, 2FA, or CAPTCHA). Use an App Password if 2FA "
+                "is enabled, approve the device, then retry. Password is never logged."
+            )
 
+        # Open the form while authenticated
+        page.goto(FORM_VIEW_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)
+        form_body = page.inner_text("body").lower()
+        if "sign in to continue" in form_body and page.get_by_role(
+            "button", name=re.compile("sign in", re.I)
+        ).count():
+            # Click the form's Sign in affordance if still present
+            try:
+                page.get_by_role("button", name=re.compile("^sign in$", re.I)).first.click(
+                    timeout=5000
+                )
+                page.wait_for_timeout(3000)
+            except Exception:
+                pass
 
-def submit_form(session: requests.Session, payload: MappedPayload) -> tuple[bool, str]:
-    """
-    POST to Google Forms formResponse endpoint.
-    Returns (success, detail).
-    """
-    form_data = payload_to_form_data(payload)
-    headers = {
-        "User-Agent": "IntouchUploader/1.0 (+authorized recruitment automation)",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": FORM_VIEW_URL,
-    }
-    try:
-        resp = session.post(
-            FORM_RESPONSE_URL,
-            data=form_data,
-            headers=headers,
-            timeout=60,
-            allow_redirects=True,
+        form_body = page.inner_text("body").lower()
+        if "sign in to continue" in form_body and "do you agree" not in form_body:
+            raise RuntimeError(
+                "Still blocked by Google Form sign-in after authentication. "
+                "Confirm hrcareers@olympuz-org.com can open the form in a browser."
+            )
+        self._signed_in = True
+        logger.info("Google sign-in complete; form is accessible")
+
+    def _click_option(self, text: str, exact: bool = True) -> None:
+        page = self._page
+        # Prefer radio/option by aria-label or visible text
+        radio = page.locator(f'[role="radio"][aria-label="{text}"]')
+        if radio.count():
+            radio.first.click()
+            return
+        if exact:
+            page.get_by_text(text, exact=True).first.click()
+        else:
+            page.get_by_text(text, exact=False).first.click()
+
+    def _fill_question_input(self, question_substring: str, value: str) -> None:
+        item = self._page.locator("div[role=listitem]").filter(
+            has_text=re.compile(re.escape(question_substring), re.I)
         )
-    except requests.RequestException as exc:
-        return False, f"form request error: {exc}"
+        box = item.locator("input[type=text], input[type=email], textarea").first
+        box.fill(value)
 
-    body = resp.text or ""
-    # Google typically returns 200 with confirmation text, or redirects.
-    body_l = body.lower()
-    has_confirmation_text = (
-        "your response has been recorded" in body_l
-        or "response has been recorded" in body_l
-    )
-    # Some Google Form posts return a sparse 200 after accept.
-    sparse_ok = resp.status_code == 200 and len(body) < 50
-    confirmed = resp.status_code in (200, 302) and (has_confirmation_text or sparse_ok)
-    if confirmed:
-        return True, f"http {resp.status_code}"
-    if resp.status_code >= 400:
-        return False, f"http {resp.status_code}"
-    # Uncertain outcome — do NOT treat as success and do not auto-retry
-    return False, f"unconfirmed submission (http {resp.status_code}, body_len={len(body)})"
+    def submit(self, payload: MappedPayload) -> tuple[bool, str]:
+        """Fill and submit the multi-page IntouchCX form for one candidate."""
+        try:
+            self.ensure_signed_in()
+        except Exception as exc:
+            return False, f"google sign-in failed: {exc}"
+
+        page = self._page
+        try:
+            page.goto(FORM_VIEW_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+
+            # Page 1: privacy consent
+            self._click_option(payload.privacy_consent)
+            page.wait_for_timeout(300)
+            next_btn = page.get_by_role("button", name=re.compile("^next$", re.I))
+            if next_btn.count():
+                next_btn.first.click()
+            else:
+                page.locator("div[role=button]", has_text=re.compile("^next$", re.I)).first.click()
+            page.wait_for_timeout(2000)
+
+            # Page 2: applicant fields
+            self._click_option(payload.referrer)
+            self._fill_question_input("Email address (Applicant)", payload.email)
+            self._fill_question_input("Full Name (Applicant)", payload.full_name)
+            self._fill_question_input("Contact Number (Applicant)", payload.contact)
+            self._click_option(payload.preferred_site)
+            self._click_option(payload.bpo_experience)
+            self._click_option(payload.residence, exact=False)
+
+            sales_q = page.locator("div[role=listitem]").filter(has_text="sales experience")
+            sales_q.get_by_text(payload.sales_experience, exact=True).first.click()
+
+            chat_q = page.locator("div[role=listitem]").filter(has_text="chat support")
+            chat_q.get_by_text(payload.chat_support, exact=True).first.click()
+
+            onsite_q = page.locator("div[role=listitem]").filter(has_text="work on site")
+            onsite_q.get_by_text(payload.work_onsite, exact=True).first.click()
+
+            tsr_q = page.locator("div[role=listitem]").filter(has_text="TSR")
+            tsr_q.get_by_text(payload.tsr_experience, exact=True).first.click()
+
+            seasonal_q = page.locator("div[role=listitem]").filter(has_text="seasonal")
+            seasonal_q.get_by_text(payload.seasonal, exact=True).first.click()
+
+            campaign_q = page.locator("div[role=listitem]").filter(has_text="Campaign")
+            campaign_q.get_by_text(payload.campaign, exact=True).first.click()
+
+            page.wait_for_timeout(500)
+            submit = page.get_by_role("button", name=re.compile("^submit$", re.I))
+            if submit.count():
+                submit.first.click()
+            else:
+                page.locator("div[role=button]", has_text=re.compile("^submit$", re.I)).first.click()
+            page.wait_for_timeout(4000)
+
+            body = page.inner_text("body")
+            body_l = body.lower()
+            if "your response has been recorded" in body_l or "response has been recorded" in body_l:
+                return True, "browser confirmation recorded"
+            # Uncertain — do not treat as success
+            shot = LOG_DIR / f"unconfirmed_{now_manila().strftime('%Y%m%d_%H%M%S')}.png"
+            try:
+                page.screenshot(path=str(shot), full_page=True)
+            except Exception:
+                shot = None
+            return False, (
+                f"unconfirmed browser submission; url={page.url}; "
+                f"screenshot={shot}; body_preview={body[:240]!r}"
+            )
+        except Exception as exc:
+            return False, f"browser form error: {exc}"
+
+
+def verify_form_reachable() -> None:
+    """Lightweight check that the public form URL loads."""
+    resp = requests.get(FORM_VIEW_URL, timeout=45)
+    resp.raise_for_status()
+    if "FB_PUBLIC_LOAD_DATA_" not in resp.text and "IntouchCX" not in resp.text:
+        raise RuntimeError("Form does not appear available / structure unrecognized")
 
 
 # ---------------------------------------------------------------------------
@@ -959,118 +1150,126 @@ def run(dry_run: bool = True, max_submit: Optional[int] = None) -> RunSummary:
 
         intouch_col = header_idx["intouch"]
         prior_success = load_successful_ids(SUBMISSION_LOG)
-        session = requests.Session()
+        browser_session: Optional[BrowserFormSession] = None
 
         if not dry_run:
-            verify_form_available(session)
+            verify_form_reachable()
+            # Fail fast if password secret is missing before any candidate loop.
+            get_google_signin_credentials()
+            browser_session = BrowserFormSession()
 
-        submitted_count = 0
-        for candidate in candidates:
-            eligibility, payload, reason = evaluate_eligibility(candidate, prior_success)
+        attempt_count = 0
+        try:
+            for candidate in candidates:
+                eligibility, payload, reason = evaluate_eligibility(candidate, prior_success)
 
-            attempt = AttemptResult(
-                candidate_id=candidate.candidate_id,
-                sheet_row=candidate.sheet_row,
-                applicant_name=candidate.applicant_name,
-                eligibility=eligibility,
-                reason=reason,
-                mapped=asdict(payload) if payload else None,
-            )
+                attempt = AttemptResult(
+                    candidate_id=candidate.candidate_id,
+                    sheet_row=candidate.sheet_row,
+                    applicant_name=candidate.applicant_name,
+                    eligibility=eligibility,
+                    reason=reason,
+                    mapped=asdict(payload) if payload else None,
+                )
 
-            if eligibility == "skip":
-                summary.total_skipped += 1
-                # Only log skips that are Oct 2+ (reduce noise from pre-cutoff rows)
-                if candidate.record_date >= CUTOFF_DATE:
-                    _persist_attempt(summary, attempt, dry_run)
-                continue
+                if eligibility == "skip":
+                    summary.total_skipped += 1
+                    # Only log skips that are Oct 2+ (reduce noise from pre-cutoff rows)
+                    if candidate.record_date >= CUTOFF_DATE:
+                        _persist_attempt(summary, attempt, dry_run)
+                    continue
 
-            if eligibility == "manual_review":
-                summary.total_manual_review += 1
-                summary.total_skipped += 1
-                _persist_attempt(summary, attempt, dry_run)
-                continue
-
-            # eligible
-            summary.total_eligible += 1
-
-            if dry_run:
-                attempt.submission = "dry_run"
-                attempt.sheet_update = "dry_run"
-                _persist_attempt(summary, attempt, dry_run)
-                continue
-
-            if max_submit is not None and submitted_count >= max_submit:
-                attempt.eligibility = "skip"
-                attempt.reason = "max-submit limit reached for this run"
-                summary.total_skipped += 1
-                _persist_attempt(summary, attempt, dry_run)
-                continue
-
-            # Pre-submit recheck of Intouch cell
-            intouch_a1 = f"{col_letter(intouch_col)}{candidate.sheet_row}"
-            current_intouch = sheets.get_cell(intouch_a1).strip()
-            if current_intouch:
-                attempt.eligibility = "skip"
-                attempt.reason = f"Intouch filled before submit: {current_intouch!r}"
-                summary.total_skipped += 1
-                _persist_attempt(summary, attempt, dry_run)
-                continue
-
-            if candidate.candidate_id in load_successful_ids(SUBMISSION_LOG):
-                attempt.eligibility = "skip"
-                attempt.reason = "duplicate prevented by submission log recheck"
-                summary.total_skipped += 1
-                _persist_attempt(summary, attempt, dry_run)
-                continue
-
-            assert payload is not None
-            ok, detail = submit_form(session, payload)
-            if not ok:
-                if "unconfirmed" in detail:
-                    attempt.submission = "unconfirmed"
-                    attempt.reason = detail
-                    summary.total_failed_or_unconfirmed += 1
-                else:
-                    attempt.submission = "failed"
-                    attempt.reason = detail
-                    summary.total_failed_or_unconfirmed += 1
-                _persist_attempt(summary, attempt, dry_run)
-                # Do not immediately retry uncertain outcomes
-                time.sleep(1)
-                continue
-
-            attempt.submission = "success"
-            # Update Intouch only after confirmed success
-            try:
-                sheets.update_cell(intouch_a1, INTOUCH_SUCCESS_MARK)
-                verified = sheets.get_cell(intouch_a1).strip()
-                if verified != INTOUCH_SUCCESS_MARK:
-                    attempt.sheet_update = "failed_verify"
-                    attempt.reason = (
-                        f"form submitted but Intouch verify failed "
-                        f"(wanted {INTOUCH_SUCCESS_MARK!r}, got {verified!r}); reconcile before retry"
-                    )
-                    summary.total_failed_or_unconfirmed += 1
-                    summary.total_submitted += 1
-                    prior_success.add(candidate.candidate_id)
+                if eligibility == "manual_review":
+                    summary.total_manual_review += 1
+                    summary.total_skipped += 1
                     _persist_attempt(summary, attempt, dry_run)
                     continue
-                attempt.sheet_update = "success"
-                summary.total_submitted += 1
-                summary.total_intouch_updated += 1
-                prior_success.add(candidate.candidate_id)
-                submitted_count += 1
-            except HttpError as exc:
-                attempt.sheet_update = "failed"
-                attempt.reason = (
-                    f"form submitted but sheet update failed: {exc}; "
-                    "reconcile before retrying form submission"
-                )
-                summary.total_submitted += 1
-                summary.total_failed_or_unconfirmed += 1
-                prior_success.add(candidate.candidate_id)
-            _persist_attempt(summary, attempt, dry_run)
-            time.sleep(1.25)  # sequential pacing
+
+                # eligible
+                summary.total_eligible += 1
+
+                if dry_run:
+                    attempt.submission = "dry_run"
+                    attempt.sheet_update = "dry_run"
+                    _persist_attempt(summary, attempt, dry_run)
+                    continue
+
+                if max_submit is not None and attempt_count >= max_submit:
+                    attempt.eligibility = "skip"
+                    attempt.reason = "max-submit limit reached for this run"
+                    summary.total_skipped += 1
+                    _persist_attempt(summary, attempt, dry_run)
+                    continue
+
+                # Pre-submit recheck of Intouch cell
+                intouch_a1 = f"{col_letter(intouch_col)}{candidate.sheet_row}"
+                current_intouch = sheets.get_cell(intouch_a1).strip()
+                if current_intouch:
+                    attempt.eligibility = "skip"
+                    attempt.reason = f"Intouch filled before submit: {current_intouch!r}"
+                    summary.total_skipped += 1
+                    _persist_attempt(summary, attempt, dry_run)
+                    continue
+
+                if candidate.candidate_id in load_successful_ids(SUBMISSION_LOG):
+                    attempt.eligibility = "skip"
+                    attempt.reason = "duplicate prevented by submission log recheck"
+                    summary.total_skipped += 1
+                    _persist_attempt(summary, attempt, dry_run)
+                    continue
+
+                assert payload is not None
+                assert browser_session is not None
+                attempt_count += 1
+                ok, detail = browser_session.submit(payload)
+                if not ok:
+                    if "unconfirmed" in detail:
+                        attempt.submission = "unconfirmed"
+                        attempt.reason = detail
+                        summary.total_failed_or_unconfirmed += 1
+                    else:
+                        attempt.submission = "failed"
+                        attempt.reason = detail
+                        summary.total_failed_or_unconfirmed += 1
+                    _persist_attempt(summary, attempt, dry_run)
+                    # Do not immediately retry uncertain outcomes
+                    time.sleep(1)
+                    continue
+
+                attempt.submission = "success"
+                # Update Intouch only after confirmed success
+                try:
+                    sheets.update_cell(intouch_a1, INTOUCH_SUCCESS_MARK)
+                    verified = sheets.get_cell(intouch_a1).strip()
+                    if verified != INTOUCH_SUCCESS_MARK:
+                        attempt.sheet_update = "failed_verify"
+                        attempt.reason = (
+                            f"form submitted but Intouch verify failed "
+                            f"(wanted {INTOUCH_SUCCESS_MARK!r}, got {verified!r}); reconcile before retry"
+                        )
+                        summary.total_failed_or_unconfirmed += 1
+                        summary.total_submitted += 1
+                        prior_success.add(candidate.candidate_id)
+                        _persist_attempt(summary, attempt, dry_run)
+                        continue
+                    attempt.sheet_update = "success"
+                    summary.total_submitted += 1
+                    summary.total_intouch_updated += 1
+                    prior_success.add(candidate.candidate_id)
+                except HttpError as exc:
+                    attempt.sheet_update = "failed"
+                    attempt.reason = (
+                        f"form submitted but sheet update failed: {exc}; "
+                        "reconcile before retrying form submission"
+                    )
+                    summary.total_submitted += 1
+                    summary.total_failed_or_unconfirmed += 1
+                    prior_success.add(candidate.candidate_id)
+                _persist_attempt(summary, attempt, dry_run)
+                time.sleep(1.25)  # sequential pacing
+        finally:
+            if browser_session is not None:
+                browser_session.close()
 
     return summary
 
