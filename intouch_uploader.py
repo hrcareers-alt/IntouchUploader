@@ -586,11 +586,23 @@ def build_mapped_payload(candidate: Candidate) -> tuple[Optional[MappedPayload],
 # ---------------------------------------------------------------------------
 
 
+def _write_service_account_file(parsed: dict[str, Any]) -> Path:
+    if parsed.get("type") != "service_account":
+        raise RuntimeError(
+            "Google credentials JSON must be a service-account key (type=service_account)"
+        )
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    out = STATE_DIR / "google_service_account.json"
+    out.write_text(json.dumps(parsed), encoding="utf-8")
+    os.chmod(out, 0o600)
+    return out
+
+
 def resolve_credentials_path() -> Path:
     """
     Resolve Google credentials from either:
       - GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON secret contents), or
-      - GOOGLE_APPLICATION_CREDENTIALS (path to an existing JSON file)
+      - GOOGLE_APPLICATION_CREDENTIALS (file path OR raw JSON contents)
     """
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if raw_json:
@@ -600,24 +612,37 @@ def resolve_credentials_path() -> Path:
             raise RuntimeError(
                 "GOOGLE_SERVICE_ACCOUNT_JSON is set but is not valid JSON"
             ) from exc
-        if not isinstance(parsed, dict) or parsed.get("type") != "service_account":
-            raise RuntimeError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON must be a Google service-account key JSON"
-            )
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        out = STATE_DIR / "google_service_account.json"
-        out.write_text(json.dumps(parsed), encoding="utf-8")
-        os.chmod(out, 0o600)
-        return out
+        if not isinstance(parsed, dict):
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON object")
+        return _write_service_account_file(parsed)
 
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if creds_path and Path(creds_path).exists():
-        return Path(creds_path)
+    if not creds_path:
+        raise RuntimeError(
+            "Missing Google credentials. Set secret GOOGLE_SERVICE_ACCOUNT_JSON "
+            "(service-account JSON contents) or GOOGLE_APPLICATION_CREDENTIALS "
+            "(path to the JSON key file)."
+        )
+
+    # Support secrets that put raw JSON into GOOGLE_APPLICATION_CREDENTIALS.
+    if creds_path.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(creds_path)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "GOOGLE_APPLICATION_CREDENTIALS looks like JSON but failed to parse"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS JSON must be an object")
+        return _write_service_account_file(parsed)
+
+    path = Path(creds_path)
+    if path.exists():
+        return path
 
     raise RuntimeError(
-        "Missing Google credentials. Set secret GOOGLE_SERVICE_ACCOUNT_JSON "
-        "(service-account JSON contents) or GOOGLE_APPLICATION_CREDENTIALS "
-        "(path to the JSON key file)."
+        "GOOGLE_APPLICATION_CREDENTIALS is set but is neither a valid file path "
+        "nor service-account JSON contents."
     )
 
 
