@@ -9,6 +9,7 @@ logs/*.json
 logs/*.jsonl
 data/submission_log.jsonl
 data/run.lock
+data/google_service_account.json
 *-service-account*.json
 credentials.json
 token.json
