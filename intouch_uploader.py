@@ -833,8 +833,14 @@ class BrowserFormSession:
         raw = os.getenv("GOOGLE_STORAGE_STATE_JSON", "").strip()
         if not raw:
             path = os.getenv("GOOGLE_STORAGE_STATE_PATH", "").strip()
-            if path and Path(path).exists():
-                raw = Path(path).read_text(encoding="utf-8")
+            candidates = []
+            if path:
+                candidates.append(Path(path))
+            candidates.append(STATE_DIR / "google_storage_state.json")
+            for candidate in candidates:
+                if candidate.exists():
+                    raw = candidate.read_text(encoding="utf-8")
+                    break
             else:
                 return None
         try:
@@ -1006,6 +1012,32 @@ class BrowserFormSession:
         box = item.locator("input[type=text], input[type=email], textarea").first
         box.fill(value)
 
+    def _check_collect_email(self) -> None:
+        """Page 1 requires recording the signed-in Google email with the response."""
+        page = self._page
+        checkbox = page.locator('[role="checkbox"][aria-label*="Record" i]')
+        if not checkbox.count():
+            checkbox = page.get_by_role(
+                "checkbox", name=re.compile("record .* email", re.I)
+            )
+        if checkbox.count():
+            checked = checkbox.first.get_attribute("aria-checked")
+            if checked != "true":
+                checkbox.first.click()
+                page.wait_for_timeout(300)
+
+    def _click_radio_value(self, value: str) -> None:
+        page = self._page
+        radio = page.locator(f'[role="radio"][aria-label="{value}"]')
+        if radio.count():
+            radio.first.click()
+            return
+        radio = page.locator(f'[role="radio"][data-value="{value}"]')
+        if radio.count():
+            radio.first.click()
+            return
+        page.get_by_text(value, exact=True).first.click()
+
     def submit(self, payload: MappedPayload) -> tuple[bool, str]:
         """Fill and submit the multi-page IntouchCX form for one candidate."""
         try:
@@ -1018,42 +1050,56 @@ class BrowserFormSession:
             page.goto(FORM_VIEW_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1500)
 
-            # Page 1: privacy consent
-            self._click_option(payload.privacy_consent)
+            # Page 1: collect signed-in email + privacy consent
+            self._check_collect_email()
+            self._click_radio_value(payload.privacy_consent)
             page.wait_for_timeout(300)
             next_btn = page.get_by_role("button", name=re.compile("^next$", re.I))
             if next_btn.count():
                 next_btn.first.click()
             else:
                 page.locator("div[role=button]", has_text=re.compile("^next$", re.I)).first.click()
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(2500)
+
+            # Confirm we left page 1
+            if page.locator('[role="radio"][aria-label="Olympuz - CXTRA006"]').count() == 0:
+                # Retry Next once if still on page 1 due to validation
+                self._check_collect_email()
+                if next_btn.count():
+                    next_btn.first.click()
+                page.wait_for_timeout(2500)
+            if page.locator('[role="radio"][aria-label="Olympuz - CXTRA006"]').count() == 0:
+                shot = LOG_DIR / f"page1_stuck_{now_manila().strftime('%Y%m%d_%H%M%S')}.png"
+                page.screenshot(path=str(shot), full_page=True)
+                return False, f"could not advance past form page 1; screenshot={shot}"
 
             # Page 2: applicant fields
-            self._click_option(payload.referrer)
+            self._click_radio_value(payload.referrer)
             self._fill_question_input("Email address (Applicant)", payload.email)
             self._fill_question_input("Full Name (Applicant)", payload.full_name)
             self._fill_question_input("Contact Number (Applicant)", payload.contact)
-            self._click_option(payload.preferred_site)
-            self._click_option(payload.bpo_experience)
-            self._click_option(payload.residence, exact=False)
+            self._click_radio_value(payload.preferred_site)
+            self._click_radio_value(payload.bpo_experience)
+            # Residence option text is long; match via aria-label/data-value first.
+            self._click_radio_value(payload.residence)
 
             sales_q = page.locator("div[role=listitem]").filter(has_text="sales experience")
-            sales_q.get_by_text(payload.sales_experience, exact=True).first.click()
+            sales_q.locator(f'[role=radio][aria-label="{payload.sales_experience}"]').first.click()
 
             chat_q = page.locator("div[role=listitem]").filter(has_text="chat support")
-            chat_q.get_by_text(payload.chat_support, exact=True).first.click()
+            chat_q.locator(f'[role=radio][aria-label="{payload.chat_support}"]').first.click()
 
             onsite_q = page.locator("div[role=listitem]").filter(has_text="work on site")
-            onsite_q.get_by_text(payload.work_onsite, exact=True).first.click()
+            onsite_q.locator(f'[role=radio][aria-label="{payload.work_onsite}"]').first.click()
 
             tsr_q = page.locator("div[role=listitem]").filter(has_text="TSR")
-            tsr_q.get_by_text(payload.tsr_experience, exact=True).first.click()
+            tsr_q.locator(f'[role=radio][aria-label="{payload.tsr_experience}"]').first.click()
 
             seasonal_q = page.locator("div[role=listitem]").filter(has_text="seasonal")
-            seasonal_q.get_by_text(payload.seasonal, exact=True).first.click()
+            seasonal_q.locator(f'[role=radio][aria-label="{payload.seasonal}"]').first.click()
 
             campaign_q = page.locator("div[role=listitem]").filter(has_text="Campaign")
-            campaign_q.get_by_text(payload.campaign, exact=True).first.click()
+            campaign_q.locator(f'[role=radio][aria-label="{payload.campaign}"]').first.click()
 
             page.wait_for_timeout(500)
             submit = page.get_by_role("button", name=re.compile("^submit$", re.I))
