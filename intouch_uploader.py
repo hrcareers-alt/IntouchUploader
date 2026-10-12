@@ -23,7 +23,9 @@ Environment:
   GOOGLE_APPLICATION_CREDENTIALS  Alternative: path to a service-account JSON file
   GOOGLE_SIGNIN_EMAIL             Google account for form sign-in
                                   (default: hrcareers@olympuz-org.com)
-  GOOGLE_SIGNIN_PASSWORD          Google password / App Password (secret; never commit)
+  GOOGLE_SIGNIN_PASSWORD          Google password (secret; never commit)
+  GOOGLE_STORAGE_STATE_JSON       Optional Playwright storage_state JSON from a
+                                  trusted signed-in browser (bypasses 2FA prompts)
   INTOUCH_SPREADSHEET_ID          Optional override (default: tracker below)
   INTOUCH_SHEET_GID               Optional override (default: 112514731)
   INTOUCH_DRY_RUN                 Set to "0" / "false" to allow live mode via env
@@ -809,17 +811,47 @@ class BrowserFormSession:
             headless=True,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        self._context = self._browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
+        storage_state = self._load_storage_state()
+        context_kwargs: dict[str, Any] = {
+            "viewport": {"width": 1280, "height": 900},
+            "user_agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
-        )
+            "locale": "en-US",
+        }
+        if storage_state is not None:
+            context_kwargs["storage_state"] = storage_state
+            logger.info("Loaded GOOGLE_STORAGE_STATE_JSON for trusted browser session")
+        self._context = self._browser.new_context(**context_kwargs)
         self._page = self._context.new_page()
         self._signed_in = False
+        self._used_storage_state = storage_state is not None
+
+    @staticmethod
+    def _load_storage_state() -> Optional[dict[str, Any]]:
+        raw = os.getenv("GOOGLE_STORAGE_STATE_JSON", "").strip()
+        if not raw:
+            path = os.getenv("GOOGLE_STORAGE_STATE_PATH", "").strip()
+            if path and Path(path).exists():
+                raw = Path(path).read_text(encoding="utf-8")
+            else:
+                return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GOOGLE_STORAGE_STATE_JSON is not valid JSON") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("GOOGLE_STORAGE_STATE_JSON must be a JSON object")
+        return data
 
     def close(self) -> None:
+        try:
+            # Persist refreshed cookies for reuse within this environment disk.
+            out = STATE_DIR / "google_storage_state.json"
+            self._context.storage_state(path=str(out))
+        except Exception:
+            pass
         try:
             self._context.close()
         except Exception:
@@ -833,27 +865,44 @@ class BrowserFormSession:
         except Exception:
             pass
 
+    def _form_accessible(self) -> bool:
+        body = self._page.inner_text("body").lower()
+        return (
+            "do you agree with intouchcx" in body
+            or "data privacy notice" in body
+            or "preferred site" in body
+        ) and "couldn’t sign you in" not in body and "couldn't sign you in" not in body
+
     def ensure_signed_in(self) -> None:
         if self._signed_in:
             return
+
+        page = self._page
+        # If a trusted storage state was provided, try the form directly first.
+        if self._used_storage_state:
+            page.goto(FORM_VIEW_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+            if self._form_accessible():
+                self._signed_in = True
+                logger.info("Form accessible via saved Google session")
+                return
+            logger.warning("Saved session did not unlock the form; falling back to password sign-in")
+
         email, password = get_google_signin_credentials()
         logger.info("Signing into Google as %s (password from secret)", email)
-        page = self._page
         page.goto(
-            "https://accounts.google.com/ServiceLogin?hl=en",
+            "https://accounts.google.com/v3/signin/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin&hl=en",
             wait_until="domcontentloaded",
             timeout=60000,
         )
         page.wait_for_timeout(1500)
 
-        # Email step
-        email_box = page.locator('input[type="email"]').first
+        email_box = page.locator("#identifierId, input[type='email']").first
         email_box.wait_for(state="visible", timeout=30000)
         email_box.fill(email)
-        page.locator("#identifierNext, button:has-text('Next')").first.click()
-        page.wait_for_timeout(2500)
+        page.locator("#identifierNext").first.click()
+        page.wait_for_timeout(3000)
 
-        # Challenge / blocked detection before password
         body = page.inner_text("body").lower()
         if any(
             p in body
@@ -861,7 +910,6 @@ class BrowserFormSession:
                 "couldn't find your google account",
                 "couldn’t find your google account",
                 "enter a valid email",
-                "couldn't sign you in",
             )
         ):
             raise RuntimeError(
@@ -869,63 +917,72 @@ class BrowserFormSession:
                 "Check GOOGLE_SIGNIN_EMAIL / account access."
             )
 
-        # Password step
         pwd_box = page.locator('input[type="password"]').first
         try:
             pwd_box.wait_for(state="visible", timeout=30000)
         except Exception as exc:
             snippet = page.inner_text("body")[:400].replace("\n", " ")
             raise RuntimeError(
-                "Google did not show the password field (possible CAPTCHA / "
-                f"2FA / workspace block). Page text: {snippet!r}"
+                "Google did not show the password field "
+                f"(possible CAPTCHA / block). Page text: {snippet!r}"
             ) from exc
         pwd_box.fill(password)
-        page.locator("#passwordNext, button:has-text('Next')").first.click()
+        page.locator("#passwordNext").first.click()
         page.wait_for_timeout(4000)
 
-        body = page.inner_text("body").lower()
-        url = page.url
-        if any(
-            p in body
-            for p in (
-                "wrong password",
-                "incorrect password",
-                "couldn't sign you in",
-                "verify it’s you",
-                "verify it's you",
-                "2-step verification",
-                "2-step",
-                "account recovery",
-                "captcha",
-            )
-        ) or "challenge" in url or "signin/rejected" in url:
-            raise RuntimeError(
-                "Google sign-in failed or requires interactive verification "
-                "(wrong password, 2FA, or CAPTCHA). Use an App Password if 2FA "
-                "is enabled, approve the device, then retry. Password is never logged."
-            )
+        # Handle 2-Step Verification: prefer phone tap and wait for approval.
+        for _ in range(24):  # up to ~2 minutes
+            body = page.inner_text("body").lower()
+            url = page.url
+            if "myaccount.google.com" in url or ("accounts.google.com" not in url and "signin" not in url):
+                break
+            if "couldn’t sign you in" in body or "couldn't sign you in" in body:
+                raise RuntimeError(
+                    "Google blocked sign-in from this unrecognized device/location. "
+                    "Approve a phone prompt from a prior attempt, sign in once from a "
+                    "trusted browser and provide GOOGLE_STORAGE_STATE_JSON, or use an "
+                    "account that allows this environment."
+                )
+            if "wrong password" in body or "incorrect password" in body:
+                raise RuntimeError("Google rejected the password in GOOGLE_SIGNIN_PASSWORD.")
+            if "2-step verification" in body or "challenge" in url:
+                # Choose phone prompt if listed
+                phone = page.get_by_text(re.compile("tap yes on your phone", re.I))
+                if phone.count():
+                    try:
+                        phone.first.click(timeout=3000)
+                        logger.info(
+                            "Waiting for Google 2FA phone approval "
+                            "(tap Yes on the phone for %s)...",
+                            email,
+                        )
+                    except Exception:
+                        pass
+                page.wait_for_timeout(5000)
+                continue
+            # Signed in enough to leave challenge pages
+            if "signin" not in url and "challenge" not in url:
+                break
+            page.wait_for_timeout(5000)
 
         # Open the form while authenticated
         page.goto(FORM_VIEW_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2000)
-        form_body = page.inner_text("body").lower()
-        if "sign in to continue" in form_body and page.get_by_role(
-            "button", name=re.compile("sign in", re.I)
-        ).count():
-            # Click the form's Sign in affordance if still present
+        page.wait_for_timeout(2500)
+        if "sign in to continue" in page.inner_text("body").lower():
             try:
-                page.get_by_role("button", name=re.compile("^sign in$", re.I)).first.click(
+                page.get_by_role("button", name=re.compile("sign in", re.I)).first.click(
                     timeout=5000
                 )
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(4000)
             except Exception:
                 pass
 
-        form_body = page.inner_text("body").lower()
-        if "sign in to continue" in form_body and "do you agree" not in form_body:
+        if not self._form_accessible():
+            snippet = page.inner_text("body")[:300].replace("\n", " ")
             raise RuntimeError(
-                "Still blocked by Google Form sign-in after authentication. "
-                "Confirm hrcareers@olympuz-org.com can open the form in a browser."
+                "Form still not accessible after Google sign-in. "
+                f"Complete phone 2FA approval or provide GOOGLE_STORAGE_STATE_JSON. "
+                f"Page preview: {snippet!r}"
             )
         self._signed_in = True
         logger.info("Google sign-in complete; form is accessible")
