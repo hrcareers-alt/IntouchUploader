@@ -819,6 +819,58 @@ class SheetsClient:
         ).execute()
 
 
+def _infer_contact_column(
+    headers: list[str],
+    values: list[list[str]],
+    idx: dict[str, Optional[int]],
+) -> Optional[int]:
+    """Infer contact column when the header label is missing or corrupted."""
+    first_i = idx.get("first_name")
+    loc_i = idx.get("location")
+    email_i = idx.get("email")
+    right_bound = None
+    for bound in (loc_i, email_i):
+        if bound is not None:
+            right_bound = bound if right_bound is None else min(right_bound, bound)
+    candidates: list[int] = []
+    for i, _h in enumerate(headers):
+        if first_i is not None and i <= first_i:
+            continue
+        if right_bound is not None and i >= right_bound:
+            continue
+        candidates.append(i)
+    if not candidates:
+        used = {v for v in idx.values() if v is not None}
+        candidates = [i for i in range(len(headers)) if i not in used]
+
+    best_i: Optional[int] = None
+    best_hits = 0
+    sample_rows = values[1:31]
+    for i in candidates:
+        hits = 0
+        seen = 0
+        for row in sample_rows:
+            if i >= len(row):
+                continue
+            cell = str(row[i] or "").strip()
+            if not cell:
+                continue
+            seen += 1
+            digits = re.sub(r"\D", "", cell)
+            if len(digits) >= 10:
+                hits += 1
+        if seen and hits >= max(3, (seen + 1) // 2) and hits > best_hits:
+            best_hits = hits
+            best_i = i
+    if best_i is not None:
+        logger.warning(
+            "Contact header missing/corrupted; inferred column index %s header=%r",
+            best_i,
+            headers[best_i],
+        )
+    return best_i
+
+
 def load_candidates(
     values: list[list[str]],
     *,
@@ -832,7 +884,17 @@ def load_candidates(
     idx = {
         "last_name": find_header(headers, "Last Name"),
         "first_name": find_header(headers, "First Name"),
-        "contact": find_header(headers, "Contact Num", "Active Mobile Number"),
+        "contact": find_header(
+            headers,
+            "Contact Num",
+            "Contact Number",
+            "Contact",
+            "Active Mobile Number",
+            "Mobile Number",
+            "Mobile",
+            "Phone",
+            "Phone Number",
+        ),
         # Prefer exact "Email" over "Email Address" (MYNIMO has both-style headers).
         "email": find_header(headers, "Email", "Email Address"),
         "location": find_header(
@@ -846,6 +908,11 @@ def load_candidates(
             headers, "Preferred Site", "Site", "Intouch Site", "Site Assignment"
         ),
     }
+    # VALID CONSENT contact header has been observed corrupted (e.g. "x`");
+    # recover by content: column between First Name and Location/Email with phone-like values.
+    if idx["contact"] is None:
+        idx["contact"] = _infer_contact_column(headers, values, idx)
+
     required = ["last_name", "first_name", "contact", "email", "location", "bpo", "timestamp", "intouch"]
     missing = [k for k in required if idx[k] is None]
     if missing:
