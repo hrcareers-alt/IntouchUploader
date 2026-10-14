@@ -27,7 +27,8 @@ Environment:
   GOOGLE_STORAGE_STATE_JSON       Optional Playwright storage_state JSON from a
                                   trusted signed-in browser (bypasses 2FA prompts)
   INTOUCH_SPREADSHEET_ID          Optional override (default: tracker below)
-  INTOUCH_SHEET_GID               Optional override (default: 112514731)
+  INTOUCH_SHEET_GID               Optional: process only this sheet gid
+                                  (default: both VALID CONSENT + MYNIMO)
   INTOUCH_DRY_RUN                 Set to "0" / "false" to allow live mode via env
 """
 
@@ -65,6 +66,24 @@ INTOUCH_SUCCESS_MARK = "Executive Team"
 DEFAULT_SPREADSHEET_ID = "1NoRX955F0dpxMReiC-6lcd3hgxFDccS3H9hzabTQghE"
 DEFAULT_SHEET_GID = 112514731  # "VALID CONSENT - TP, FVR & EXL"
 DEFAULT_GOOGLE_SIGNIN_EMAIL = "hrcareers@olympuz-org.com"
+
+# Daily routine sources: VALID CONSENT + MYNIMO (each has an Intouch column).
+SOURCE_SHEETS = [
+    {"gid": 112514731, "key": "valid_consent"},  # VALID CONSENT - TP, FVR & EXL
+    {"gid": 360587240, "key": "mynimo"},  # MYNIMO
+]
+
+
+def resolve_source_sheets() -> list[dict[str, Any]]:
+    """Return sheets to process. INTOUCH_SHEET_GID limits to a single tab when set."""
+    override = os.getenv("INTOUCH_SHEET_GID", "").strip()
+    if override:
+        gid = int(override)
+        for src in SOURCE_SHEETS:
+            if src["gid"] == gid:
+                return [src]
+        return [{"gid": gid, "key": f"gid_{gid}"}]
+    return list(SOURCE_SHEETS)
 
 FORM_VIEW_URL = (
     "https://docs.google.com/forms/d/e/"
@@ -212,6 +231,8 @@ class Candidate:
     intouch: str
     status: str = ""
     preferred_site_raw: str = ""
+    source_sheet: str = ""
+    source_gid: int = 0
 
     @property
     def applicant_name(self) -> str:
@@ -219,8 +240,20 @@ class Candidate:
 
     @property
     def candidate_id(self) -> str:
-        """Stable id: sheet row + email + contact (not name alone)."""
-        return f"row:{self.sheet_row}|email:{self.email.lower()}|contact:{self.contact}"
+        """Stable id: source sheet + row + email + contact (not name alone)."""
+        sheet = self.source_sheet or "unknown"
+        return (
+            f"sheet:{sheet}|row:{self.sheet_row}|"
+            f"email:{self.email.lower()}|contact:{self.contact}"
+        )
+
+    @property
+    def legacy_candidate_id(self) -> str:
+        """Pre-multi-source id format (VALID CONSENT-era submission log)."""
+        return (
+            f"row:{self.sheet_row}|"
+            f"email:{self.email.lower()}|contact:{self.contact}"
+        )
 
 
 @dataclass
@@ -251,6 +284,7 @@ class AttemptResult:
     sheet_update: str = "not_attempted"
     reason: str = ""
     mapped: Optional[dict[str, str]] = None
+    source_sheet: str = ""
 
 
 @dataclass
@@ -377,20 +411,32 @@ def map_bpo_experience(raw: str) -> tuple[Optional[str], Optional[str]]:
     if s in no_exp or "no bpo" in s or s == "no experience":
         return "No Experience", None
 
-    years = None
-    months = None
-    m_year = re.search(r"(\d+(?:\.\d+)?)\s*(?:years?|yrs?)\b", s)
-    if m_year:
-        years = float(m_year.group(1))
-    m_month = re.search(r"(\d+)\s*(?:months?|mos?|mo)\b", s)
-    if m_month:
-        months = int(m_month.group(1))
-    if months is None:
-        m_glued = re.search(r"(\d+)months?\b", s)
-        if m_glued:
-            months = int(m_glued.group(1))
+    # MYNIMO-style ranges: "1 - 5 Months", "6 - 11 Months"
+    m_month_range = re.search(r"(\d+)\s*-\s*(\d+)\s*(?:months?|mos?)\b", s)
+    if m_month_range:
+        total_months = int(m_month_range.group(1))
+        years = None
+        months = total_months
+    else:
+        years = None
+        months = None
+        # MYNIMO-style: "2 Years & Above", "3 Years & Above"
+        m_years_above = re.search(r"(\d+)\s*(?:years?|yrs?)\s*&\s*above\b", s)
+        if m_years_above:
+            years = float(m_years_above.group(1))
+        else:
+            m_year = re.search(r"(\d+(?:\.\d+)?)\s*(?:years?|yrs?)\b", s)
+            if m_year:
+                years = float(m_year.group(1))
+            m_month = re.search(r"(\d+)\s*(?:months?|mos?|mo)\b", s)
+            if m_month:
+                months = int(m_month.group(1))
+            if months is None:
+                m_glued = re.search(r"(\d+)months?\b", s)
+                if m_glued:
+                    months = int(m_glued.group(1))
 
-    if years is not None and months is not None:
+    if years is not None and months is not None and not m_month_range:
         total_months = int(years * 12) + months
     elif years is not None:
         total_months = int(years * 12)
@@ -773,7 +819,12 @@ class SheetsClient:
         ).execute()
 
 
-def load_candidates(values: list[list[str]]) -> tuple[list[Candidate], dict[str, int], list[str]]:
+def load_candidates(
+    values: list[list[str]],
+    *,
+    source_sheet: str = "",
+    source_gid: int = 0,
+) -> tuple[list[Candidate], dict[str, int], list[str]]:
     if not values:
         raise RuntimeError("Spreadsheet is empty or inaccessible")
 
@@ -782,8 +833,11 @@ def load_candidates(values: list[list[str]]) -> tuple[list[Candidate], dict[str,
         "last_name": find_header(headers, "Last Name"),
         "first_name": find_header(headers, "First Name"),
         "contact": find_header(headers, "Contact Num", "Active Mobile Number"),
+        # Prefer exact "Email" over "Email Address" (MYNIMO has both-style headers).
         "email": find_header(headers, "Email", "Email Address"),
-        "location": find_header(headers, "City of Residence", "Location", "location"),
+        "location": find_header(
+            headers, "City of Residence", "City Of Residence", "Location", "location"
+        ),
         "bpo": find_header(headers, "BPO EXP", "BPO or Callcenter Experience"),
         "timestamp": find_header(headers, "Timestamp", "Date", "Record Date"),
         "intouch": find_header(headers, "Intouch"),
@@ -796,7 +850,8 @@ def load_candidates(values: list[list[str]]) -> tuple[list[Candidate], dict[str,
     missing = [k for k in required if idx[k] is None]
     if missing:
         raise RuntimeError(
-            f"Required headers not found: {missing}. Actual headers: {headers}"
+            f"Required headers not found on {source_sheet or 'sheet'}: {missing}. "
+            f"Actual headers: {headers}"
         )
 
     candidates: list[Candidate] = []
@@ -829,6 +884,8 @@ def load_candidates(values: list[list[str]]) -> tuple[list[Candidate], dict[str,
                 intouch=cell("intouch").strip(),
                 status=cell("status").strip(),
                 preferred_site_raw=cell("preferred_site").strip(),
+                source_sheet=source_sheet,
+                source_gid=source_gid,
             )
         )
     return candidates, {k: v for k, v in idx.items() if v is not None}, headers
@@ -1266,7 +1323,9 @@ def evaluate_eligibility(
         return "skip", None, f"record date {candidate.record_date} before cutoff {CUTOFF_DATE}"
     if not is_blank(candidate.intouch):
         return "skip", None, "Intouch cell is not empty"
-    if candidate.candidate_id in prior_success:
+    if candidate.candidate_id in prior_success or (
+        candidate.legacy_candidate_id in prior_success
+    ):
         return "skip", None, "already successfully submitted per automation log"
 
     payload, err = build_mapped_payload(candidate)
@@ -1287,28 +1346,11 @@ def run(dry_run: bool = True, max_submit: Optional[int] = None) -> RunSummary:
     )
 
     spreadsheet_id = os.getenv("INTOUCH_SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)
-    sheet_gid = int(os.getenv("INTOUCH_SHEET_GID", str(DEFAULT_SHEET_GID)))
+    sources = resolve_source_sheets()
     creds_path = resolve_credentials_path()
 
     with RunLock(RUN_LOCK):
         sheets = SheetsClient(spreadsheet_id, creds_path)
-        sheet_title = sheets.resolve_sheet(sheet_gid)
-        logger.info("Resolved sheet gid=%s title=%r", sheet_gid, sheet_title)
-
-        try:
-            values = sheets.read_all_values()
-        except HttpError as exc:
-            raise RuntimeError(f"Spreadsheet inaccessible; aborting run: {exc}") from exc
-
-        if not values:
-            raise RuntimeError("Spreadsheet returned no data; aborting without submissions")
-
-        candidates, header_idx, headers = load_candidates(values)
-        summary.total_records_scanned = max(0, len(values) - 1)
-        logger.info("Headers: %s", headers)
-        logger.info("Header indices: %s", header_idx)
-
-        intouch_col = header_idx["intouch"]
         prior_success = load_successful_ids(SUBMISSION_LOG)
         browser_session: Optional[BrowserFormSession] = None
 
@@ -1320,113 +1362,154 @@ def run(dry_run: bool = True, max_submit: Optional[int] = None) -> RunSummary:
 
         attempt_count = 0
         try:
-            for candidate in candidates:
-                eligibility, payload, reason = evaluate_eligibility(candidate, prior_success)
-
-                attempt = AttemptResult(
-                    candidate_id=candidate.candidate_id,
-                    sheet_row=candidate.sheet_row,
-                    applicant_name=candidate.applicant_name,
-                    eligibility=eligibility,
-                    reason=reason,
-                    mapped=asdict(payload) if payload else None,
+            for source in sources:
+                sheet_gid = int(source["gid"])
+                source_key = str(source["key"])
+                sheet_title = sheets.resolve_sheet(sheet_gid)
+                logger.info(
+                    "Resolved sheet key=%s gid=%s title=%r",
+                    source_key,
+                    sheet_gid,
+                    sheet_title,
                 )
 
-                if eligibility == "skip":
-                    summary.total_skipped += 1
-                    # Only log skips that are Oct 2+ (reduce noise from pre-cutoff rows)
-                    if candidate.record_date >= CUTOFF_DATE:
-                        _persist_attempt(summary, attempt, dry_run)
-                    continue
-
-                if eligibility == "manual_review":
-                    summary.total_manual_review += 1
-                    summary.total_skipped += 1
-                    _persist_attempt(summary, attempt, dry_run)
-                    continue
-
-                # eligible
-                summary.total_eligible += 1
-
-                if dry_run:
-                    attempt.submission = "dry_run"
-                    attempt.sheet_update = "dry_run"
-                    _persist_attempt(summary, attempt, dry_run)
-                    continue
-
-                if max_submit is not None and attempt_count >= max_submit:
-                    attempt.eligibility = "skip"
-                    attempt.reason = "max-submit limit reached for this run"
-                    summary.total_skipped += 1
-                    _persist_attempt(summary, attempt, dry_run)
-                    continue
-
-                # Pre-submit recheck of Intouch cell
-                intouch_a1 = f"{col_letter(intouch_col)}{candidate.sheet_row}"
-                current_intouch = sheets.get_cell(intouch_a1).strip()
-                if current_intouch:
-                    attempt.eligibility = "skip"
-                    attempt.reason = f"Intouch filled before submit: {current_intouch!r}"
-                    summary.total_skipped += 1
-                    _persist_attempt(summary, attempt, dry_run)
-                    continue
-
-                if candidate.candidate_id in load_successful_ids(SUBMISSION_LOG):
-                    attempt.eligibility = "skip"
-                    attempt.reason = "duplicate prevented by submission log recheck"
-                    summary.total_skipped += 1
-                    _persist_attempt(summary, attempt, dry_run)
-                    continue
-
-                assert payload is not None
-                assert browser_session is not None
-                attempt_count += 1
-                ok, detail = browser_session.submit(payload)
-                if not ok:
-                    if "unconfirmed" in detail:
-                        attempt.submission = "unconfirmed"
-                        attempt.reason = detail
-                        summary.total_failed_or_unconfirmed += 1
-                    else:
-                        attempt.submission = "failed"
-                        attempt.reason = detail
-                        summary.total_failed_or_unconfirmed += 1
-                    _persist_attempt(summary, attempt, dry_run)
-                    # Do not immediately retry uncertain outcomes
-                    time.sleep(1)
-                    continue
-
-                attempt.submission = "success"
-                # Update Intouch only after confirmed success
                 try:
-                    sheets.update_cell(intouch_a1, INTOUCH_SUCCESS_MARK)
-                    verified = sheets.get_cell(intouch_a1).strip()
-                    if verified != INTOUCH_SUCCESS_MARK:
-                        attempt.sheet_update = "failed_verify"
-                        attempt.reason = (
-                            f"form submitted but Intouch verify failed "
-                            f"(wanted {INTOUCH_SUCCESS_MARK!r}, got {verified!r}); reconcile before retry"
-                        )
-                        summary.total_failed_or_unconfirmed += 1
-                        summary.total_submitted += 1
-                        prior_success.add(candidate.candidate_id)
+                    values = sheets.read_all_values()
+                except HttpError as exc:
+                    raise RuntimeError(
+                        f"Spreadsheet inaccessible for {source_key}; aborting run: {exc}"
+                    ) from exc
+
+                if not values:
+                    logger.warning("Sheet %s returned no data; skipping tab", source_key)
+                    continue
+
+                candidates, header_idx, headers = load_candidates(
+                    values,
+                    source_sheet=source_key,
+                    source_gid=sheet_gid,
+                )
+                summary.total_records_scanned += max(0, len(values) - 1)
+                logger.info("[%s] Headers: %s", source_key, headers)
+                logger.info("[%s] Header indices: %s", source_key, header_idx)
+
+                intouch_col = header_idx["intouch"]
+
+                for candidate in candidates:
+                    eligibility, payload, reason = evaluate_eligibility(
+                        candidate, prior_success
+                    )
+
+                    attempt = AttemptResult(
+                        candidate_id=candidate.candidate_id,
+                        sheet_row=candidate.sheet_row,
+                        applicant_name=candidate.applicant_name,
+                        eligibility=eligibility,
+                        reason=reason,
+                        mapped=asdict(payload) if payload else None,
+                        source_sheet=source_key,
+                    )
+
+                    if eligibility == "skip":
+                        summary.total_skipped += 1
+                        # Only log skips that are Oct 2+ (reduce noise from pre-cutoff rows)
+                        if candidate.record_date >= CUTOFF_DATE:
+                            _persist_attempt(summary, attempt, dry_run)
+                        continue
+
+                    if eligibility == "manual_review":
+                        summary.total_manual_review += 1
+                        summary.total_skipped += 1
                         _persist_attempt(summary, attempt, dry_run)
                         continue
-                    attempt.sheet_update = "success"
-                    summary.total_submitted += 1
-                    summary.total_intouch_updated += 1
-                    prior_success.add(candidate.candidate_id)
-                except HttpError as exc:
-                    attempt.sheet_update = "failed"
-                    attempt.reason = (
-                        f"form submitted but sheet update failed: {exc}; "
-                        "reconcile before retrying form submission"
-                    )
-                    summary.total_submitted += 1
-                    summary.total_failed_or_unconfirmed += 1
-                    prior_success.add(candidate.candidate_id)
-                _persist_attempt(summary, attempt, dry_run)
-                time.sleep(1.25)  # sequential pacing
+
+                    # eligible
+                    summary.total_eligible += 1
+
+                    if dry_run:
+                        attempt.submission = "dry_run"
+                        attempt.sheet_update = "dry_run"
+                        _persist_attempt(summary, attempt, dry_run)
+                        continue
+
+                    if max_submit is not None and attempt_count >= max_submit:
+                        attempt.eligibility = "skip"
+                        attempt.reason = "max-submit limit reached for this run"
+                        summary.total_skipped += 1
+                        _persist_attempt(summary, attempt, dry_run)
+                        continue
+
+                    # Pre-submit recheck of Intouch cell
+                    intouch_a1 = f"{col_letter(intouch_col)}{candidate.sheet_row}"
+                    current_intouch = sheets.get_cell(intouch_a1).strip()
+                    if current_intouch:
+                        attempt.eligibility = "skip"
+                        attempt.reason = f"Intouch filled before submit: {current_intouch!r}"
+                        summary.total_skipped += 1
+                        _persist_attempt(summary, attempt, dry_run)
+                        continue
+
+                    success_ids = load_successful_ids(SUBMISSION_LOG)
+                    if (
+                        candidate.candidate_id in success_ids
+                        or candidate.legacy_candidate_id in success_ids
+                    ):
+                        attempt.eligibility = "skip"
+                        attempt.reason = "duplicate prevented by submission log recheck"
+                        summary.total_skipped += 1
+                        _persist_attempt(summary, attempt, dry_run)
+                        continue
+
+                    assert payload is not None
+                    assert browser_session is not None
+                    attempt_count += 1
+                    ok, detail = browser_session.submit(payload)
+                    if not ok:
+                        if "unconfirmed" in detail:
+                            attempt.submission = "unconfirmed"
+                            attempt.reason = detail
+                            summary.total_failed_or_unconfirmed += 1
+                        else:
+                            attempt.submission = "failed"
+                            attempt.reason = detail
+                            summary.total_failed_or_unconfirmed += 1
+                        _persist_attempt(summary, attempt, dry_run)
+                        # Do not immediately retry uncertain outcomes
+                        time.sleep(1)
+                        continue
+
+                    attempt.submission = "success"
+                    # Update Intouch only after confirmed success
+                    try:
+                        sheets.update_cell(intouch_a1, INTOUCH_SUCCESS_MARK)
+                        verified = sheets.get_cell(intouch_a1).strip()
+                        if verified != INTOUCH_SUCCESS_MARK:
+                            attempt.sheet_update = "failed_verify"
+                            attempt.reason = (
+                                f"form submitted but Intouch verify failed "
+                                f"(wanted {INTOUCH_SUCCESS_MARK!r}, got {verified!r}); "
+                                "reconcile before retry"
+                            )
+                            summary.total_failed_or_unconfirmed += 1
+                            summary.total_submitted += 1
+                            prior_success.add(candidate.candidate_id)
+                            _persist_attempt(summary, attempt, dry_run)
+                            continue
+                        attempt.sheet_update = "success"
+                        summary.total_submitted += 1
+                        summary.total_intouch_updated += 1
+                        prior_success.add(candidate.candidate_id)
+                    except HttpError as exc:
+                        attempt.sheet_update = "failed"
+                        attempt.reason = (
+                            f"form submitted but sheet update failed: {exc}; "
+                            "reconcile before retrying form submission"
+                        )
+                        summary.total_submitted += 1
+                        summary.total_failed_or_unconfirmed += 1
+                        prior_success.add(candidate.candidate_id)
+                    _persist_attempt(summary, attempt, dry_run)
+                    time.sleep(1.25)  # sequential pacing
         finally:
             if browser_session is not None:
                 browser_session.close()
@@ -1441,6 +1524,7 @@ def _persist_attempt(summary: RunSummary, attempt: AttemptResult, dry_run: bool)
         "run_at_manila": summary.run_at_manila,
         "mode": summary.mode,
         "candidate_id": attempt.candidate_id,
+        "source_sheet": attempt.source_sheet,
         "sheet_row": attempt.sheet_row,
         "applicant_name": attempt.applicant_name,
         "eligibility": attempt.eligibility,
@@ -1453,7 +1537,8 @@ def _persist_attempt(summary: RunSummary, attempt: AttemptResult, dry_run: bool)
         record["mapped"] = attempt.mapped
     append_log(SUBMISSION_LOG if not dry_run else LOG_DIR / "dry_run.jsonl", record)
     logger.info(
-        "row=%s eligibility=%s submission=%s sheet_update=%s reason=%s",
+        "sheet=%s row=%s eligibility=%s submission=%s sheet_update=%s reason=%s",
+        attempt.source_sheet or "-",
         attempt.sheet_row,
         attempt.eligibility,
         attempt.submission,
@@ -1484,14 +1569,17 @@ def print_summary(summary: RunSummary) -> None:
             bpo = (a.mapped or {}).get("bpo_experience", "")
             residence = (a.mapped or {}).get("residence", "")
             print(
-                f"  row {a.sheet_row}: {a.applicant_name} | "
+                f"  [{a.source_sheet or '-'}] row {a.sheet_row}: {a.applicant_name} | "
                 f"{residence} | {site} | BPO={bpo} | submission={a.submission}"
             )
 
     if manual:
         print(f"\n--- Manual review ({len(manual)}) ---")
         for a in manual[:50]:
-            print(f"  row {a.sheet_row}: {a.applicant_name} | {a.reason}")
+            print(
+                f"  [{a.source_sheet or '-'}] row {a.sheet_row}: "
+                f"{a.applicant_name} | {a.reason}"
+            )
         if len(manual) > 50:
             print(f"  ... and {len(manual) - 50} more")
 
